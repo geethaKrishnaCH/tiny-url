@@ -1,0 +1,11 @@
+services:
+  redis:
+    image: redis:8.4.0-alpine3.22
+    container_name: redis-server
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+volumes:
+  redis_data:
