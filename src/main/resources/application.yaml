@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: tiny-url
+redis:
+  host: 127.0.0.1
+  port: 6379
+  ssl:
+    enabled: true
+    trust-store: classpath:certs/redis-truststore.jks
+    trust-store-password: changeit
+
+server:
+  port: 8080
+  servlet:
+    context-path: /tinyurl
+
+logging:
+  file:
+    name: logs/tiny-url.log
+#  level:
+#    root: DEBUG
+#    io.netty.handler.ssl: DEBUG
+#    io.lettuce.core.ssl: TRACE
+#    org.springframework.data.redis: TRACE
