@@ -2,8 +2,8 @@ spring:
   application:
     name: tiny-url
 redis:
-  host: 127.0.0.1
-  port: 6379
+  host: ${REDIS_HOST:localhost}
+  port: ${REDIS_PORT:6379}
   ssl:
     enabled: true
     trust-store: classpath:certs/redis-truststore.jks
