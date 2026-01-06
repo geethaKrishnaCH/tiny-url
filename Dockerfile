@@ -8,6 +8,9 @@ RUN mvn clean -B package -DskipTests
 
 # 2. runtime stage: use a jre image to run the built jar file
 FROM eclipse-temurin:17.0.17_10-jre-alpine-3.23
+RUN adduser -D -h /home/appuser -s /bin/sh appuser
+USER appuser
+
 WORKDIR /app
 COPY --from=build /app/target/tiny-url-app.jar .
 EXPOSE 8080

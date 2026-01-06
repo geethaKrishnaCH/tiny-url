@@ -2,11 +2,13 @@ services:
   redis:
     build: ./redis
     container_name: redis-server
-#    ports:
-#      - "6379:6379"
+    #    ports:
+    #      - "6379:6379"
     volumes:
       - redis_data:/data
-    restart: unless-stopped
+#    restart: unless-stopped
+    networks:
+      - backend
   app:
     build: .
     container_name: tiny-url-app
@@ -17,5 +19,12 @@ services:
       REDIS_PORT: 6379
     ports:
       - "8080:8080"
+    volumes:
+      - ./redis/certs/redis-truststore.jks:/app/certs/redis-truststore.jks:ro
+    networks:
+      - backend
 volumes:
   redis_data:
+networks:
+  backend:
+    driver: bridge
