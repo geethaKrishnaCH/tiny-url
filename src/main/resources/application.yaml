@@ -6,7 +6,7 @@ redis:
   port: ${REDIS_PORT:6379}
   ssl:
     enabled: true
-    trust-store: file:/app/certs/redis-truststore.jks
+    trust-store: file:/app/redis-truststore.jks
     trust-store-password: changeit
 
 server:

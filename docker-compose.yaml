@@ -2,10 +2,14 @@ services:
   redis:
     build: ./redis
     container_name: redis-server
-    #    ports:
-    #      - "6379:6379"
+    depends_on:
+      - vault
+      - vault-agent
+    ports:
+      - "6379:6379"
     volumes:
       - redis_data:/data
+      - tls_certs:/certs:ro
 #    restart: unless-stopped
     networks:
       - backend
@@ -14,13 +18,15 @@ services:
     container_name: tiny-url-app
     depends_on:
       - redis
+      - vault
+      - vault-agent
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
     ports:
       - "8080:8080"
     volumes:
-      - ./redis/certs/redis-truststore.jks:/app/certs/redis-truststore.jks:ro
+      - tls_certs:/app/certs
     networks:
       - backend
   vault:
@@ -39,8 +45,23 @@ services:
       - ./vault/data:/vault/data
     networks:
       - backend
+  vault-agent:
+    image: hashicorp/vault:1.21
+    container_name: vault-agent
+    depends_on:
+      - vault
+    volumes:
+      - ./vault/agent/config/vault-agent.hcl:/vault/agent/config/vault-agent.hcl
+      - ./vault/agent/templates:/vault/agent/templates
+      - ./vault/agent/logs:/vault/agent/logs
+      - ./vault/agent/auth:/vault/agent/auth
+      - tls_certs:/home/vault
+    command: ["vault", "agent", "-config=/vault/agent/config/vault-agent.hcl"]
+    networks:
+      - backend
 volumes:
   redis_data:
+  tls_certs:
 networks:
   backend:
     driver: bridge
