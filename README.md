@@ -1,279 +1,328 @@
-# Redis TLS with Vault PKI (Layer 4)
+# Layer 5 – Vault Agent with Docker Compose (Vault + Redis + Spring Boot)
 
-This document describes how to secure Redis with TLS using **HashiCorp Vault as a PKI (Certificate Authority)** and how a Spring Boot application trusts Redis using Vault-issued certificates.
+This layer introduces **Vault Agent** into the architecture and demonstrates how a Spring Boot application securely connects to Redis over TLS **without the application or Redis ever talking directly to Vault**.
 
-This replaces manual OpenSSL-based certificate generation with a **documented, auditable Vault workflow**.
+The focus of this layer is:
+
+* Understanding **why Vault Agent exists**
+* Seeing **how secrets and certificates flow** from Vault → filesystem → application
+* Running everything locally using **Docker Compose**, while keeping the setup production-realistic
 
 ---
 
 ## Architecture Overview
 
-```
-Vault (PKI / CA)
-   |
-   | issues certificates
-   |
-Redis  <── TLS ──>  Spring Boot
-```
+We run **four services**, each with a clear responsibility:
 
-* Vault is **not** in the runtime data path
-* Vault manages **certificate lifecycle only**
-* Redis and Spring Boot consume certificates as files
+| Service         | Responsibility                                          |
+| --------------- | ------------------------------------------------------- |
+| Vault           | Source of truth (PKI, auth, policies)                   |
+| Vault Agent     | Authenticates to Vault and materializes certs as files  |
+| Redis           | TLS server using certs written by Vault Agent           |
+| Spring Boot App | TLS client that trusts Redis via a generated truststore |
 
----
+**Key design rule**:
 
-## Prerequisites
-
-* Docker and Docker Compose
-* Vault CLI installed on the host
-* `jq`, `openssl`, `keytool`
-* Redis + Spring Boot already working with TLS (Layer 3)
+> Redis and the application are completely **Vault-agnostic**. Only Vault Agent talks to Vault.
 
 ---
 
-## 1. Start Vault with Persistent Storage
+## High-Level Startup Sequence
 
-Vault is run in non-dev mode with a file-based storage backend.
+⚠️ **Order matters in this layer**. Vault bootstrap is intentionally manual to build understanding.
 
-### Directory Structure
+1. Start Vault
+2. Initialize and unseal Vault
+3. Enable PKI, create policy and AppRole
+4. Fetch `role_id` and `secret_id`
+5. Start Vault Agent
+6. Start Redis
+7. Start Spring Boot application
 
-```
-vault/
-├── config/
-│   └── vault.hcl
-└── data/
-```
+---
 
-### `vault/config/vault.hcl`
+## 1. Start Vault
 
-```hcl
-ui = true
+Vault is started **separately** from Docker Compose.
 
-storage "file" {
-  path = "/vault/data"
-}
-
-listener "tcp" {
-  address     = "0.0.0.0:8200"
-  tls_disable = 1
-}
-```
-
-### Docker Compose (Vault service)
-
-```yaml
-vault:
-  image: hashicorp/vault:1.15
-  container_name: vault
-  ports:
-    - "8200:8200"
-  volumes:
-    - ./vault/config:/vault/config
-    - ./vault/data:/vault/data
-  cap_add:
-    - IPC_LOCK
-  command: ["vault", "server", "-config=/vault/config/vault.hcl"]
-```
-
-Start Vault:
+Example (dev mode):
 
 ```bash
-docker compose up -d vault
+docker compose start vault
 ```
 
----
-
-## 2. Initialize and Unseal Vault
-
-Run on the host machine:
+Set environment variable:
 
 ```bash
 export VAULT_ADDR=http://localhost:8200
-vault operator init
 ```
 
-Save:
-
-* Unseal keys
-* Root token
-
-Unseal Vault (repeat until unsealed):
+Verify:
 
 ```bash
+vault status
+```
+
+---
+
+## 2. Initialize & Unseal Vault (non-dev mode only)
+
+If running Vault in non-dev mode:
+
+```bash
+vault operator init
 vault operator unseal
 ```
 
-Login:
-
-```bash
-vault login <root-token>
-```
+(Dev mode skips this step.)
 
 ---
 
-## 3. Enable PKI Secrets Engine
-`<PKI_MOUNT_PATH>` for redis pki 
-secret engine is `pki-redis`
+## 3. Enable PKI and Create CA
+
+Enable PKI:
+
 ```bash
-vault secrets enable -path=<PKI_MOUNT_PATH> pki
+vault secrets enable -path=pki-redis pki
 ```
 
-Set maximum certificate lifetime:
+Tune max TTL:
 
 ```bash
-vault secrets tune -max-lease-ttl=8760h <PKI_MOUNT_PATH>
+vault secrets tune -max-lease-ttl=8760h pki-redis
 ```
 
----
-
-## 4. Generate Root CA (Vault-managed)
-
-Vault becomes the Root Certificate Authority.
+Generate root CA:
 
 ```bash
-vault write <PKI_MOUNT_PATH>/root/generate/internal \
-  common_name="root-ca" \
+vault write pki-redis/root/generate/internal \
+  common_name="redis-root-ca" \
   ttl=8760h
 ```
 
-Notes:
-
-* CA private key never leaves Vault
-* Vault is now the trust anchor
-
 ---
 
-## 5. Export CA Certificate (Public Only)
-
-Redis and Spring Boot must trust the CA.
+## 4. Create PKI Role for Redis
 
 ```bash
-vault read -field=certificate <PKI_MOUNT_PATH>/cert/ca \
-  > redis/certs/root/ca.crt
-```
-
-Verify:
-
-```bash
-openssl x509 -in redis/certs/root/ca.crt -text -noout
-```
-
----
-
-## 6. Create PKI Role for Redis
-
-The role defines what kind of certificates are allowed to exist.
-
-```bash
-vault write <PKI_MOUNT_PATH>/roles/redis-server \
+vault write pki-redis/roles/redis-server \
   allowed_domains="redis,localhost" \
-  allow_subdomains=true \
   allow_bare_domains=true \
+  allow_subdomains=true \
   allow_ip_sans=true \
-  max_ttl="24h"
+  max_ttl="5m"
+```
+
+This role controls **what certificates Vault Agent is allowed to issue**.
+
+---
+
+## 5. Create Vault Policy for Vault Agent
+
+Create policy file `agent-certs-policy.hcl`:
+
+```hcl
+path "pki-redis/issue/redis-server" {
+  capabilities = ["create", "update"]
+}
+
+path "pki-redis/cert/ca" {
+  capabilities = ["read"]
+}
+
+path "auth/token/lookup-self" {
+  capabilities = ["read"]
+}
+```
+
+Apply policy:
+
+```bash
+vault policy write agent-policy ./vault/agent/policy/agent-certs-policy.hcl
 ```
 
 ---
 
-## 7. Issue Redis Server Certificate
+## 6. Create AppRole
 
 ```bash
-vault write -format=json <PKI_MOUNT_PATH>/issue/redis-server \
-  common_name="redis" \
-  alt_names="localhost" \
-  ip_sans="127.0.0.1" \
-  > redis-cert.json
+vault auth enable approle
 ```
 
-Extract certificate and key:
-
 ```bash
-jq -r '.data.certificate' redis-cert.json \
-  > redis/certs/redis/redis.crt
-
-jq -r '.data.private_key' redis-cert.json \
-  > redis/certs/redis/redis.key
-
-chmod 600 redis/certs/redis/redis.key
+vault write auth/approle/role/redis-agent \
+  policies="agent-policy" \
+  token_ttl=10m \
+  token_max_ttl=30m \
+  secret_id_num_uses=0 \
+  secret_id_ttl=1h
 ```
 
 ---
 
-## 8. Create Java Truststore from Vault CA
-
-Spring Boot trusts Redis via the CA.
+## 7. Fetch role_id and secret_id
 
 ```bash
-keytool -importcert \
-  -alias vault-redis-ca \
-  -file redis/certs/root/ca.crt \
-  -keystore redis/certs/redis-truststore.jks \
-  -storepass changeit \
-  -noprompt
+vault read auth/approle/role/redis-agent/role-id
+```
+
+```bash
+vault write -f auth/approle/role/redis-agent/secret-id
+```
+
+Save outputs as files:
+
+```text
+echo <ROLE_ID> ./vault/agent/auth/role_id
+echo <SECRET_ID> ./vault/agent/auth/secret_id
+```
+
+⚠️ secret_id will be deleted once vault-agent starts
+
+⚠️ These files must **not** be committed to source control.
+
+---
+
+## 8. Start Vault Agent
+
+Vault Agent is started via Docker Compose. 
+
+Vault agent config file `vault-agent.hcl`
+
+```text
+vault {
+  address = "http://vault:8200"
+}
+
+auto_auth {
+  method "approle" {
+    mount_path = "auth/approle"
+    config = {
+      role_id_file_path   = "/vault/agent/auth/role_id"
+      secret_id_file_path = "/vault/agent/auth/secret_id"
+    }
+  }
+
+  sink "file" {
+    config = {
+      path = "/vault/agent/auth/token"
+    }
+  }
+}
+
+template {
+  source      = "/vault/agent/templates/hello.tpl"
+  destination = "/home/vault/hello.txt"
+}
+
+template {
+    source      = "/vault/agent/templates/ca.tpl"
+    destination = "/home/vault/ca.crt"
+}
+
+template {
+  source = "/vault/agent/templates/redis.tpl"
+  destination = "/home/vault/null"
+}
+```
+
+
+It will:
+
+* Authenticate using AppRole
+* Fetch CA certificate
+* Issue Redis certificate + private key
+* Write all material into `/home/vault`
+
+```bash
+docker compose up vault-agent
 ```
 
 Verify:
 
 ```bash
-keytool -list -v \
-  -keystore redis/certs/redis-truststore.jks \
-  -storepass changeit
-```
-
----
-
-## 9. Restart Redis and Application
-
-```bash
-docker compose restart redis app
-```
-
----
-
-## 10. Verification
-
-### Redis presents Vault-issued certificate
-
-```bash
-openssl s_client -connect redis:6379 -showcerts
+docker exec -it vault-agent sh
+ls -l home/vault
 ```
 
 Expected:
 
+* `ca.crt`
+* `redis.crt`
+* `redis.key`
+
+---
+
+## 9. Start Redis
+
+Redis uses TLS and reads certs from the shared volume:
+
+```bash
+docker compose up redis
 ```
-Issuer: CN=root-ca
+
+Redis **never talks to Vault**.
+
+---
+
+## 10. Start Spring Boot Application
+
+The application startup script:
+
+* Waits for `ca.crt`
+* Generates a JKS truststore using `keytool`
+* Starts the JVM
+
+```bash
+docker compose up app
 ```
 
-### Application behavior
-
-* Spring Boot starts successfully
-* Redis operations succeed
-* TLS verification is strict
-* No hostname verification bypass
+Spring Boot connects to Redis using TLS with the generated truststore.
 
 ---
 
-## Security Model Summary
+## Important Design Notes
 
-* Vault is the control plane
-* Redis and Spring Boot never talk to Vault
-* Certificates are the trust boundary
-* Root CA private key never leaves Vault
-* Short-lived certs reduce blast radius
+### Why Vault Agent Exists
+
+* Removes Vault SDK from applications
+* Eliminates secret handling in code
+* Enables short-lived certs and rotation
+
+### Why AppRole Is Manual Here
+
+* Docker Compose has no identity system
+* AppRole provides a generic bootstrap mechanism
+* This disappears in Kubernetes (Layer 6)
+
+### Why Startup Order Matters
+
+* Vault must be ready before Vault Agent
+* Vault Agent must write certs before Redis
+* Truststore must exist before JVM starts
 
 ---
 
-## What This Enables Next
+## What This Layer Demonstrates
 
-* Vault Agent (file-based cert delivery)
-* Automated certificate rotation
-* Kubernetes authentication
-* mTLS
-* Service meshes (Istio)
+✔ End-to-end TLS using Vault PKI
+✔ No secrets in application code
+✔ Vault Agent as a sidecar process
+✔ Runtime truststore generation
+✔ Production-grade separation of concerns
 
 ---
 
-## Status
+## What Comes Next
 
-✔ Layer 4 complete
-➡ Ready for **Layer 5 – Vault Agent**
+* Layer 6: Kubernetes (Vault Agent injection)
+* Layer 7: Vault Kubernetes auth
+* Layer 8: Certificate rotation strategies
+* Layer 9: mTLS
+* Layer 10: Service mesh integration
+
+---
+
+**Layer 5 is complete.**
+
+This layer is intentionally complex because it builds the mental model required for secure systems. Kubernetes will simplify mechanics — not concepts.

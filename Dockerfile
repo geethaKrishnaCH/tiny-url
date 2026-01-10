@@ -13,5 +13,7 @@ USER appuser
 
 WORKDIR /app
 COPY --from=build /app/target/tiny-url-app.jar .
+COPY init-truststore.sh init-truststore.sh
 EXPOSE 8080
-CMD ["java", "-jar", "tiny-url-app.jar"]
+CMD ["sh", "./init-truststore.sh"]
+#CMD ["sleep", "infinity"]
